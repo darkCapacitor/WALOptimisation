@@ -1,6 +1,5 @@
--- Create a numbers table for generating sequences
 WITH NumberSequence AS (
-    SELECT TOP (10000) -- Adjust this number based on your maximum expected iterations
+    SELECT TOP (1000) -- Adjust based on your maximum expected iterations
         ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS N
     FROM master.dbo.spt_values t1
     CROSS JOIN master.dbo.spt_values t2
@@ -33,8 +32,8 @@ WorkingDayPayments AS (
     FROM RepaymentDates r
 ),
 
--- Calculate interest applications
-InterestCalculations AS (
+-- Calculate interest applications and repayments
+Calculations AS (
     SELECT 
         N,
         PaymentDate,
@@ -42,21 +41,10 @@ InterestCalculations AS (
             WHEN @InterestAppliedToCode = '1' AND (N-1) % 3 = 0
             THEN @BalanceAmt * @EffIntRate * 90 / 36500
             ELSE 0
-        END AS InterestAmount
-    FROM WorkingDayPayments
-),
-
--- Calculate cumulative repayments and balances
-Repayments AS (
-    SELECT 
-        N,
-        PaymentDate,
-        InterestAmount,
+        END AS InterestAmount,
         @RepaymentAmt AS RepaymentAmount,
-        SUM(InterestAmount) OVER (ORDER BY N) AS CumulativeInterest,
-        SUM(@RepaymentAmt) OVER (ORDER BY N) AS CumulativeRepayment,
-        @BalanceAmt + SUM(@RepaymentAmt) OVER (ORDER BY N) AS RunningBalance
-    FROM InterestCalculations
+        @BalanceAmt + (@RepaymentAmt * N) AS RunningBalance
+    FROM WorkingDayPayments
 )
 
 -- Final result set
@@ -70,12 +58,15 @@ SELECT
     END AS RepaymentAmount,
     CASE
         WHEN RunningBalance >= 0 OR PaymentDate = @ExpiryDate THEN 0
-        ELSE LEAST(ABS(RunningBalance), RepaymentAmount)
+        ELSE CASE 
+            WHEN ABS(RunningBalance) < RepaymentAmount THEN ABS(RunningBalance)
+            ELSE RepaymentAmount
+        END
     END AS PrincipalAmount,
     PaymentDate
-FROM Repayments
+FROM Calculations
 WHERE RunningBalance < 0 OR PaymentDate = @ExpiryDate
 ORDER BY N;
 
 -- Update final balance (if needed for further processing)
-UPDATE @BalanceAmt = (SELECT TOP 1 RunningBalance FROM Repayments ORDER BY N DESC);
+SET @BalanceAmt = (SELECT TOP 1 RunningBalance FROM Calculations ORDER BY N DESC);
