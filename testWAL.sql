@@ -1,25 +1,48 @@
-WITH NumberSequence AS (
-    SELECT TOP (1000) -- Adjust based on your maximum expected iterations
-        ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS N
-    FROM master.dbo.spt_values t1
-    CROSS JOIN master.dbo.spt_values t2
-),
-
--- Generate repayment schedule
-RepaymentSchedule AS (
+WITH RepaymentSchedule AS (
+    -- Base case
     SELECT 
-        N,
+        1 AS N,
+        @NextPaymentDate AS ScheduledDate,
+        @BalanceAmt AS Balance,
+        @CurrentSequence AS CurrentSeq,
+        @NextInterestSequence AS NextIntSeq,
+        @Sequence AS Seq
+    
+    UNION ALL
+    
+    -- Recursive case
+    SELECT 
+        r.N + 1,
+        DATEADD(MONTH, @RepayPeriodMths, r.ScheduledDate),
+        r.Balance + 
+            CASE 
+                WHEN @InterestAppliedToCode = '1' AND r.CurrentSeq = r.NextIntSeq
+                THEN r.Balance * @EffIntRate * 90 / 36500
+                ELSE 0
+            END + 
+            CASE 
+                WHEN r.ScheduledDate < @ExpiryDate THEN @RepaymentAmt
+                ELSE 0
+            END,
+        r.CurrentSeq + 1,
         CASE 
-            WHEN N = 1 THEN @NextPaymentDate
-            ELSE DATEADD(MONTH, (N-1) * @RepayPeriodMths, @NextPaymentDate)
-        END AS ScheduledDate
-    FROM NumberSequence
+            WHEN @InterestAppliedToCode = '1' AND r.CurrentSeq = r.NextIntSeq
+            THEN r.NextIntSeq + 3
+            ELSE r.NextIntSeq
+        END,
+        r.Seq + @RepayPeriodMths
+    FROM RepaymentSchedule r
+    WHERE r.Balance < 0 AND r.ScheduledDate <= @ExpiryDate
 ),
 
--- Adjust for working days and apply interest
-Calculations AS (
+-- Adjust for working days
+WorkingDayPayments AS (
     SELECT 
         r.N,
+        r.Balance,
+        r.CurrentSeq,
+        r.NextIntSeq,
+        r.Seq,
         COALESCE(
             (SELECT TOP 1 c.AsAtDate
              FROM [dbo].[syn_Model_tbl_Dim_Calendar] c
@@ -30,14 +53,7 @@ Calculations AS (
                AND c.AsAtDate <= @ExpiryDate
              ORDER BY c.AsAtDate DESC),
             @ExpiryDate
-        ) AS PaymentDate,
-        CASE 
-            WHEN @InterestAppliedToCode = '1' AND ((r.N - 1) % 3 = 0)
-            THEN @BalanceAmt * @EffIntRate * 90 / 36500
-            ELSE 0
-        END AS InterestAmount,
-        @RepaymentAmt AS RepaymentAmount,
-        @BalanceAmt + (@RepaymentAmt * r.N) AS RunningBalance
+        ) AS PaymentDate
     FROM RepaymentSchedule r
 )
 
@@ -46,23 +62,33 @@ INSERT INTO DW.CAU_RepaymentsSchedules_TEMP (FacilityId, RepaymentAmount, Princi
 SELECT 
     @FacilityId,
     CASE
-        WHEN PaymentDate = @ExpiryDate THEN ABS(RunningBalance) + InterestAmount
-        WHEN RunningBalance >= 0 THEN 0
+        WHEN PaymentDate = @ExpiryDate THEN ABS(Balance) + 
+            CASE 
+                WHEN @InterestAppliedToCode = '1' AND CurrentSeq = NextIntSeq
+                THEN Balance * @EffIntRate * 90 / 36500
+                ELSE 0
+            END
+        WHEN Balance >= 0 THEN 0
         ELSE 
             CASE
-                WHEN ABS(RunningBalance) < RepaymentAmount THEN ABS(RunningBalance) + InterestAmount
-                ELSE RepaymentAmount + InterestAmount
+                WHEN ABS(Balance) < @RepaymentAmt THEN ABS(Balance)
+                ELSE @RepaymentAmt
+            END + 
+            CASE 
+                WHEN @InterestAppliedToCode = '1' AND CurrentSeq = NextIntSeq
+                THEN Balance * @EffIntRate * 90 / 36500
+                ELSE 0
             END
     END AS RepaymentAmount,
     CASE
-        WHEN RunningBalance >= 0 OR PaymentDate = @ExpiryDate THEN 0
+        WHEN Balance >= 0 OR PaymentDate = @ExpiryDate THEN 0
         ELSE 
             CASE
-                WHEN ABS(RunningBalance) < RepaymentAmount THEN ABS(RunningBalance)
-                ELSE RepaymentAmount
+                WHEN ABS(Balance) < @RepaymentAmt THEN ABS(Balance)
+                ELSE @RepaymentAmt
             END
     END AS PrincipalAmount,
     PaymentDate
-FROM Calculations
-WHERE RunningBalance < 0 OR PaymentDate = @ExpiryDate
+FROM WorkingDayPayments
+WHERE Balance < 0 OR PaymentDate = @ExpiryDate
 ORDER BY N;
