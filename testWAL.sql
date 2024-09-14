@@ -3,7 +3,7 @@ WITH RepaymentSchedule AS (
     SELECT 
         1 AS N,
         @NextPaymentDate AS ScheduledDate,
-        @BalanceAmt AS Balance,
+        CAST(@BalanceAmt AS DECIMAL(18,2)) AS Balance,
         @CurrentSequence AS CurrentSeq,
         @NextInterestSequence AS NextIntSeq,
         @Sequence AS Seq
@@ -14,7 +14,7 @@ WITH RepaymentSchedule AS (
     SELECT 
         r.N + 1,
         DATEADD(MONTH, @RepayPeriodMths, r.ScheduledDate),
-        r.Balance + 
+        CAST(r.Balance + 
             CASE 
                 WHEN @InterestAppliedToCode = '1' AND r.CurrentSeq = r.NextIntSeq
                 THEN r.Balance * @EffIntRate * 90 / 36500
@@ -23,7 +23,7 @@ WITH RepaymentSchedule AS (
             CASE 
                 WHEN r.ScheduledDate < @ExpiryDate THEN @RepaymentAmt
                 ELSE 0
-            END,
+            END AS DECIMAL(18,2)),
         r.CurrentSeq + 1,
         CASE 
             WHEN @InterestAppliedToCode = '1' AND r.CurrentSeq = r.NextIntSeq
@@ -61,7 +61,7 @@ WorkingDayPayments AS (
 INSERT INTO DW.CAU_RepaymentsSchedules_TEMP (FacilityId, RepaymentAmount, PrincipalAmount, PaymentDate)
 SELECT 
     @FacilityId,
-    CASE
+    CAST(CASE
         WHEN PaymentDate = @ExpiryDate THEN ABS(Balance) + 
             CASE 
                 WHEN @InterestAppliedToCode = '1' AND CurrentSeq = NextIntSeq
@@ -79,15 +79,15 @@ SELECT
                 THEN Balance * @EffIntRate * 90 / 36500
                 ELSE 0
             END
-    END AS RepaymentAmount,
-    CASE
+    END AS DECIMAL(18,2)) AS RepaymentAmount,
+    CAST(CASE
         WHEN Balance >= 0 OR PaymentDate = @ExpiryDate THEN 0
         ELSE 
             CASE
                 WHEN ABS(Balance) < @RepaymentAmt THEN ABS(Balance)
                 ELSE @RepaymentAmt
             END
-    END AS PrincipalAmount,
+    END AS DECIMAL(18,2)) AS PrincipalAmount,
     PaymentDate
 FROM WorkingDayPayments
 WHERE Balance < 0 OR PaymentDate = @ExpiryDate
