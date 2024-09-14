@@ -10,9 +10,9 @@ RecursiveRepayments AS
     -- Anchor query: Start with initial values
     SELECT
         @FacilityId AS FacilityId,
-        @BalanceAmt AS BalanceAmt,
-        @RepaymentInterest AS RepaymentInterest,
-        @IsFirstPayment AS IsFirstPayment,
+        CAST(@BalanceAmt AS DECIMAL(18, 2)) AS BalanceAmt,          -- Ensure BalanceAmt is DECIMAL
+        CAST(@RepaymentInterest AS DECIMAL(18, 2)) AS RepaymentInterest,  -- Ensure RepaymentInterest is DECIMAL
+        CAST(@IsFirstPayment AS INT) AS IsFirstPayment,             -- Ensure IsFirstPayment is INT
         @Sequence AS Sequence,
         @NextPaymentDate AS NextPaymentDate,
         @InterestAppliedToCode AS InterestAppliedToCode,
@@ -21,7 +21,7 @@ RecursiveRepayments AS
         @CurrentSequence AS CurrentSequence,
         @ExpiryDate AS ExpiryDate,
         @RepaymentAmt AS RepaymentAmt,
-        0 AS InterestAmt,
+        CAST(0 AS DECIMAL(18, 2)) AS InterestAmt,                  -- Ensure InterestAmt is DECIMAL
         @NextInterestSequence AS NextInterestSequence,
         CASE 
             WHEN @IsFirstPayment = 1 THEN @NextPaymentDate
@@ -33,15 +33,19 @@ RecursiveRepayments AS
     -- Recursive query: Calculate for each iteration until balance is non-negative
     SELECT
         r.FacilityId,
-        CASE 
-            WHEN r.ExpiryDate > r.NextPayment THEN r.BalanceAmt + r.RepaymentAmt
-            ELSE r.BalanceAmt
-        END AS BalanceAmt,
-        CASE 
-            WHEN r.ExpiryDate > r.NextPayment THEN r.RepaymentInterest
-            ELSE 0.0
-        END AS RepaymentInterest,
-        0 AS IsFirstPayment, 
+        CAST(
+            CASE 
+                WHEN r.ExpiryDate > r.NextPayment THEN r.BalanceAmt + r.RepaymentAmt
+                ELSE r.BalanceAmt
+            END AS DECIMAL(18, 2)
+        ) AS BalanceAmt,                                         -- Cast to DECIMAL
+        CAST(
+            CASE 
+                WHEN r.ExpiryDate > r.NextPayment THEN r.RepaymentInterest
+                ELSE 0.0
+            END AS DECIMAL(18, 2)
+        ) AS RepaymentInterest,                                  -- Cast to DECIMAL
+        CAST(0 AS INT) AS IsFirstPayment,                        -- Cast to INT
         r.Sequence + r.RepayPeriodMths AS Sequence,
         c.AsAtDate AS NextPaymentDate,
         r.InterestAppliedToCode,
@@ -50,12 +54,14 @@ RecursiveRepayments AS
         r.CurrentSequence + 1 AS CurrentSequence,
         r.ExpiryDate,
         r.RepaymentAmt,
-        CASE 
-            -- Interest calculation based on sequence
-            WHEN r.InterestAppliedToCode = '1' AND r.NextInterestSequence = r.CurrentSequence THEN 
-                r.BalanceAmt * r.EffIntRate * 90 / 36500
-            ELSE 0
-        END AS InterestAmt,
+        CAST(
+            CASE 
+                -- Interest calculation based on sequence
+                WHEN r.InterestAppliedToCode = '1' AND r.NextInterestSequence = r.CurrentSequence THEN 
+                    r.BalanceAmt * r.EffIntRate * 90 / 36500
+                ELSE 0
+            END AS DECIMAL(18, 2)
+        ) AS InterestAmt,                                        -- Cast to DECIMAL
         r.NextInterestSequence + CASE WHEN r.InterestAppliedToCode = '1' AND r.NextInterestSequence = r.CurrentSequence THEN 3 ELSE 0 END,
         DATEADD(MONTH, r.RepayPeriodMths, r.NextPayment) AS NextPayment
     FROM RecursiveRepayments r
