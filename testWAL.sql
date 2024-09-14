@@ -1,94 +1,87 @@
-WITH RepaymentSchedule AS (
-    -- Base case
-    SELECT 
-        1 AS N,
-        @NextPaymentDate AS ScheduledDate,
-        CAST(@BalanceAmt AS DECIMAL(18,2)) AS Balance,
-        @CurrentSequence AS CurrentSeq,
-        @NextInterestSequence AS NextIntSeq,
-        @Sequence AS Seq
-    
-    UNION ALL
-    
-    -- Recursive case
-    SELECT 
-        r.N + 1,
-        DATEADD(MONTH, @RepayPeriodMths, r.ScheduledDate),
-        CAST(r.Balance + 
-            CASE 
-                WHEN @InterestAppliedToCode = '1' AND r.CurrentSeq = r.NextIntSeq
-                THEN r.Balance * @EffIntRate * 90 / 36500
-                ELSE 0
-            END + 
-            CASE 
-                WHEN r.ScheduledDate < @ExpiryDate THEN @RepaymentAmt
-                ELSE 0
-            END AS DECIMAL(18,2)),
-        r.CurrentSeq + 1,
-        CASE 
-            WHEN @InterestAppliedToCode = '1' AND r.CurrentSeq = r.NextIntSeq
-            THEN r.NextIntSeq + 3
-            ELSE r.NextIntSeq
-        END,
-        r.Seq + @RepayPeriodMths
-    FROM RepaymentSchedule r
-    WHERE r.Balance < 0 AND r.ScheduledDate <= @ExpiryDate
-),
+-- Create a temporary table to store results
+CREATE TABLE #TempRepaymentSchedule (
+    FacilityId INT,
+    RepaymentAmount DECIMAL(18,2),
+    PrincipalAmount DECIMAL(18,2),
+    PaymentDate DATE
+);
 
--- Adjust for working days
-WorkingDayPayments AS (
-    SELECT 
-        r.N,
-        r.Balance,
-        r.CurrentSeq,
-        r.NextIntSeq,
-        r.Seq,
-        COALESCE(
-            (SELECT TOP 1 c.AsAtDate
-             FROM [dbo].[syn_Model_tbl_Dim_Calendar] c
-             WHERE c.RegionCode = 'UK' 
-               AND c.IsWorkingDay = 1 
-               AND c.[Month] = MONTH(r.ScheduledDate)
-               AND c.[Year] = YEAR(r.ScheduledDate)
-               AND c.AsAtDate <= @ExpiryDate
-             ORDER BY c.AsAtDate DESC),
-            @ExpiryDate
-        ) AS PaymentDate
-    FROM RepaymentSchedule r
-)
+-- Optimize the WHILE loop
+WHILE (@BalanceAmt < 0)
+BEGIN
+    -- Calculate interest if applicable
+    IF (@InterestAppliedToCode = '1' AND @CurrentSequence = @NextInterestSequence)
+    BEGIN
+        SET @InterestAmt = @BalanceAmt * @EffIntRate * 90 / 36500;
+        SET @BalanceAmt = @BalanceAmt + @InterestAmt;
+        SET @NextInterestSequence = @NextInterestSequence + 3;
+        SET @RepaymentInterest = @RepaymentInterest + @InterestAmt;
+    END
+    ELSE
+    BEGIN
+        SET @InterestAmt = 0;
+    END
 
--- Final result set
+    -- Process repayment
+    IF (@InterestAppliedToCode <> '1' OR @Sequence = @CurrentSequence)
+    BEGIN
+        SET @NextPayment = CASE
+            WHEN @IsFirstPayment = 1 THEN @NextPaymentDate
+            ELSE DATEADD(MONTH, @RepayPeriodMths, @NextPaymentDate)
+        END;
+
+        -- Get the next working day payment date
+        SELECT TOP 1 @NextPaymentDate = CASE
+            WHEN @ExpiryDate <= AsAtDate THEN @ExpiryDate
+            ELSE AsAtDate
+        END
+        FROM [dbo].[syn_Model_tbl_Dim_Calendar]
+        WHERE RegionCode = 'UK' 
+          AND IsWorkingDay = 1 
+          AND [Month] = MONTH(@NextPayment)
+          AND [Year] = YEAR(@NextPayment)
+          AND AsAtDate <= @ExpiryDate
+        ORDER BY AsAtDate DESC;
+
+        SET @BalanceAmt = CASE
+            WHEN @ExpiryDate > @NextPaymentDate THEN @BalanceAmt + @RepaymentAmt
+            ELSE @BalanceAmt
+        END;
+        
+        SET @NextRepaymentAmt = CASE
+            WHEN @ExpiryDate <= @NextPaymentDate THEN ABS(@BalanceAmt) + @RepaymentInterest
+            WHEN @BalanceAmt + @RepaymentAmt < @RepaymentAmt THEN @RepaymentAmt + @RepaymentInterest
+            ELSE ABS(@BalanceAmt) + @RepaymentInterest
+        END;
+
+        -- Insert into temporary table instead of permanent table
+        INSERT INTO #TempRepaymentSchedule (FacilityId, RepaymentAmount, PrincipalAmount, PaymentDate)
+        VALUES (
+            @FacilityId, 
+            @NextRepaymentAmt, 
+            CASE 
+                WHEN @BalanceAmt > 0 OR @ExpiryDate <= @NextPaymentDate THEN 0
+                ELSE ABS(@BalanceAmt)
+            END,
+            @NextPaymentDate
+        );
+
+        SET @IsFirstPayment = 0;
+        SET @BalanceAmt = CASE
+            WHEN @ExpiryDate <= @NextPaymentDate THEN 0
+            ELSE @BalanceAmt
+        END;
+        SET @Sequence = @Sequence + @RepayPeriodMths;
+        SET @RepaymentInterest = 0.0;
+    END
+
+    SET @CurrentSequence = @CurrentSequence + 1;
+END
+
+-- Bulk insert from temporary table to permanent table
 INSERT INTO DW.CAU_RepaymentsSchedules_TEMP (FacilityId, RepaymentAmount, PrincipalAmount, PaymentDate)
-SELECT 
-    @FacilityId,
-    CAST(CASE
-        WHEN PaymentDate = @ExpiryDate THEN ABS(Balance) + 
-            CASE 
-                WHEN @InterestAppliedToCode = '1' AND CurrentSeq = NextIntSeq
-                THEN Balance * @EffIntRate * 90 / 36500
-                ELSE 0
-            END
-        WHEN Balance >= 0 THEN 0
-        ELSE 
-            CASE
-                WHEN ABS(Balance) < @RepaymentAmt THEN ABS(Balance)
-                ELSE @RepaymentAmt
-            END + 
-            CASE 
-                WHEN @InterestAppliedToCode = '1' AND CurrentSeq = NextIntSeq
-                THEN Balance * @EffIntRate * 90 / 36500
-                ELSE 0
-            END
-    END AS DECIMAL(18,2)) AS RepaymentAmount,
-    CAST(CASE
-        WHEN Balance >= 0 OR PaymentDate = @ExpiryDate THEN 0
-        ELSE 
-            CASE
-                WHEN ABS(Balance) < @RepaymentAmt THEN ABS(Balance)
-                ELSE @RepaymentAmt
-            END
-    END AS DECIMAL(18,2)) AS PrincipalAmount,
-    PaymentDate
-FROM WorkingDayPayments
-WHERE Balance < 0 OR PaymentDate = @ExpiryDate
-ORDER BY N;
+SELECT FacilityId, RepaymentAmount, PrincipalAmount, PaymentDate
+FROM #TempRepaymentSchedule;
+
+-- Clean up
+DROP TABLE #TempRepaymentSchedule;
